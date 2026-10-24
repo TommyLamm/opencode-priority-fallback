@@ -1,0 +1,29 @@
+{
+  "name": "opencode-priority-fallback",
+  "version": "0.1.0",
+  "description": "opencode 2.x plugin: keep sessions on the highest-priority available model, fall back only after native retries are exhausted, switch back after a cooldown",
+  "type": "module",
+  "main": "priority-fallback.js",
+  "files": [
+    "priority-fallback.js"
+  ],
+  "scripts": {
+    "test": "node --test test/priority-fallback.test.mjs"
+  },
+  "engines": {
+    "node": ">=20.4"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "fallback",
+    "model",
+    "retry"
+  ],
+  "author": "TommyLamm",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/TommyLamm/opencode-priority-fallback.git"
+  }
+}
