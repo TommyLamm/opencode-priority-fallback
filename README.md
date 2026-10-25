@@ -3,7 +3,7 @@
 [opencode](https://opencode.ai) 2.x 的插件：讓每個會話盡量使用優先序最高、目前可用的模型。
 
 - **不干預 opencode 自己的重試。** 目前的模型重試全部失敗、執行真的停下後，才切到下一個模型，並自動送出 `continue`。
-- **失敗的模型冷卻 10 分鐘。** 冷卻結束後，在下一步結束時或你發新訊息時切回去。
+- **失敗的模型冷卻 10 分鐘。** 錯誤有指定更長的等待時間（`retryAfterMs`，例如每日免費額度要等到隔天重置）時，就冷卻到那個時間，最多 24 小時。冷卻結束後，在下一步結束時或你發新訊息時切回去。
 - **全部模型都在冷卻時，等最早結束冷卻的那個再試。** 無限次重試，不需要人工介入。
 
 和 [opencode-runtime-fallback](https://www.npmjs.com/package/opencode-runtime-fallback) 的差別：runtime-fallback 在第一次出錯時就攔下原生重試並換模型；這個插件則讓原生重試先跑完。
@@ -44,11 +44,13 @@
 
 收到 `session.execution.failed`，代表 opencode 的原生重試已經用完，或錯誤本來就不會重試。這時：
 
-1. 錯誤類型屬於「會切換」的那一類，就讓目前的模型進入冷卻。冷卻是全域的，所有會話共用。
+1. 錯誤類型屬於「會切換」的那一類，就讓目前的模型進入冷卻。冷卻時間是 `COOLDOWN_MS` 和錯誤的 `retryAfterMs` 中較長的那個，上限 `MAX_COOLDOWN_MS`。冷卻是全域的，所有會話共用。
 2. 從 `PRIORITY` 裡挑第一個「沒在冷卻、而且 context 裝得下」的模型，切過去（`session.switchModel`）。
 3. 送出 `continue`，讓會話繼續工作。
 
 如果所有能用的模型都在冷卻，就等最早結束冷卻的那個，到時候再重複上面的步驟。
+
+等待期間，只有在新的 execution 真的開始跑步驟（`session.step.started`）時才會取消等待，例如你自己發了新訊息。opencode 在失敗後有時會立刻開一個不跑任何步驟、馬上就成功結束的空 execution，這種不會取消等待。
 
 ### 切回優先序更高的模型
 
@@ -89,6 +91,7 @@
 |---|---|---|
 | `PRIORITY` | 見上方 | 模型優先序 |
 | `COOLDOWN_MS` | 10 分鐘 | 失敗模型的冷卻時間 |
+| `MAX_COOLDOWN_MS` | 24 小時 | 錯誤的 `retryAfterMs` 比 `COOLDOWN_MS` 長時，冷卻時間的上限 |
 | `THROTTLE_MS` | 60 秒 | 清單外模型失敗後，等多久才送 `continue` |
 | `MIN_GAP_MS` | 5 秒 | 同一個會話兩次 `continue` 之間的最短間隔 |
 | `CONTEXT_HEADROOM` | 32,000 | 判斷 context 裝不裝得下時預留的空間 |

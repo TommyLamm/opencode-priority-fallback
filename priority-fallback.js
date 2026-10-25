@@ -6,7 +6,8 @@
  *
  * - Never touches opencode's own retries. Only after an execution has finally
  *   failed (session.execution.failed) with a switchable error does the failed
- *   model go into a COOLDOWN_MS cooldown (shared by all sessions). The session
+ *   model go into a cooldown (shared by all sessions): COOLDOWN_MS, or the
+ *   error's retryAfterMs when longer (a daily free limit). The session
  *   then moves to the first model in PRIORITY that is not cooling down and
  *   whose context limit fits the session, and is sent "continue".
  * - When every usable model is cooling down, waits for the earliest cooldown
@@ -40,6 +41,9 @@ const PRIORITY = [
   "nvidia/z-ai/glm-5.3-flash",
 ];
 const COOLDOWN_MS = 10 * 60_000;
+// A longer retryAfterMs on the error (e.g. a daily free limit) extends the
+// cooldown, up to this cap.
+const MAX_COOLDOWN_MS = 24 * 3600_000;
 const THROTTLE_MS = 60_000; // continue delay for sessions on a model outside PRIORITY
 const MIN_GAP_MS = 5_000; // never send two continues to one session closer than this
 // A model fits a session only if the session's last context size leaves this
@@ -332,8 +336,9 @@ async function setup(ctx) {
       return schedule(sessionID, now + THROTTLE_MS, `model outside priority list, ${summarize(error)}`);
     }
     if (!matches(error, SWITCH_TYPES)) return log(`ignore failure session=${sessionID} model=${label(info.model)} ${summarize(error)}`);
-    shared.cooldowns.set(current, now + COOLDOWN_MS);
-    log(`cooldown ${current} for ${COOLDOWN_MS}ms after ${summarize(error)} session=${sessionID}`);
+    const cooldown = Math.min(Math.max(COOLDOWN_MS, Number(error.retryAfterMs) || 0), MAX_COOLDOWN_MS);
+    shared.cooldowns.set(current, now + cooldown);
+    log(`cooldown ${current} for ${cooldown}ms after ${summarize(error)} session=${sessionID}`);
     schedule(sessionID, Math.max(now, state.lastContinue + MIN_GAP_MS), "failed");
   }
 
@@ -368,9 +373,14 @@ async function setup(ctx) {
     const sessionID = data.sessionID;
     if (!sessionID || !mine(event)) return;
 
+    // A pending wait is cancelled only by an execution that actually runs a
+    // step: right after a failure opencode may start an empty execution that
+    // succeeds at once, and that must not drop the wait.
     switch (type) {
       case "session.step.started": {
         const state = sessionState(sessionID);
+        state.stepped = true;
+        cancel(sessionID, "step started");
         if (data.model) {
           state.model = data.model;
           state.variants.set(keyOf(data.model), variantOf(data.model));
@@ -392,12 +402,16 @@ async function setup(ctx) {
         enqueue(sessionID, "failure handling", () => onFailed(sessionID, data.error));
         return;
       case "session.execution.started":
-        return cancel(sessionID, "execution started");
+        sessionState(sessionID).stepped = false;
+        return;
       case "session.execution.interrupted":
         return cancel(sessionID, `interrupted:${data.reason}`);
-      case "session.execution.succeeded":
-        sessionState(sessionID).attempts = 0;
+      case "session.execution.succeeded": {
+        const state = sessionState(sessionID);
+        if (!state.stepped) return log(`keep wait session=${sessionID} (empty execution succeeded)`);
+        state.attempts = 0;
         return cancel(sessionID, "succeeded");
+      }
       case "session.deleted":
         cancel(sessionID, "deleted");
         shared.sessions.delete(sessionID);

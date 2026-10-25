@@ -229,16 +229,63 @@ test("a model outside the list is continued after 60s on the same model, quota i
   assert.deepEqual(h.calls, ["prompt s1 continue"]);
 });
 
-test("a new execution cancels a pending wait", async () => {
+test("a new execution that runs a step cancels a pending wait", async () => {
   await start();
   h.addSession("s1", OUTSIDE);
   fail("s1", "provider.transport");
   await flush();
   h.emit("session.execution.started", { sessionID: "s1" });
+  stepStart("s1", OUTSIDE);
   await flush();
   mock.timers.tick(2 * MIN);
   await flush();
   assert.deepEqual(h.calls, []);
+});
+
+test("an empty execution right after the failure does not cancel the switch", async () => {
+  await start();
+  h.addSession("s1", M1, "max");
+  stepStart("s1", M1, "max");
+  // What opencode emitted on 2026-10-24: failed, then an empty execution that succeeds at once.
+  fail("s1", "provider.free-limit", "Free usage limit reached.");
+  h.emit("session.execution.started", { sessionID: "s1" });
+  h.emit("session.execution.succeeded", { sessionID: "s1" });
+  await flush();
+  assert.deepEqual(h.calls, [`switch s1 ${M2}#max`, "prompt s1 continue"]);
+});
+
+test("an empty execution does not cancel an all-cooling wait either", async () => {
+  await start();
+  h.addSession("s1", OUTSIDE);
+  fail("s1", "provider.transport");
+  await flush();
+  h.emit("session.execution.started", { sessionID: "s1" });
+  h.emit("session.execution.succeeded", { sessionID: "s1" });
+  await flush();
+  mock.timers.tick(MIN + 1);
+  await flush();
+  assert.deepEqual(h.calls, ["prompt s1 continue"]);
+});
+
+test("retryAfterMs longer than the cooldown keeps the model cooling until then", async () => {
+  await start();
+  h.addSession("s1", M1, "max");
+  stepStart("s1", M1, "max");
+  h.emit("session.execution.failed", {
+    sessionID: "s1",
+    error: { type: "provider.free-limit", message: "Free usage limit reached.", status: 429, retryAfterMs: 8 * 60 * MIN },
+  });
+  await flush();
+  h.calls.length = 0;
+  mock.timers.tick(10 * MIN + 1);
+  stepStart("s1", M2, "max");
+  stepEnd("s1");
+  await flush();
+  assert.deepEqual(h.calls, [], "10 minutes is not enough: the free limit resets in 8 hours");
+  mock.timers.tick(8 * 60 * MIN);
+  stepEnd("s1");
+  await flush();
+  assert.deepEqual(h.calls, [`switch s1 ${M1}#max`]);
 });
 
 test("events for another location are ignored", async () => {
