@@ -4,12 +4,15 @@
  * Keeps each top-level session on the highest-priority model in PRIORITY that
  * is available:
  *
- * - Never touches opencode's own retries. Only after an execution has finally
- *   failed (session.execution.failed) with a switchable error does the failed
- *   model go into a cooldown (shared by all sessions): COOLDOWN_MS, or the
- *   error's retryAfterMs when longer (a daily free limit). The session
+ * - Never touches a top-level session's own retries. Only after its execution
+ *   has finally failed (session.execution.failed) with a switchable error does
+ *   the failed model go into a cooldown (shared by all sessions): COOLDOWN_MS,
+ *   or the error's retryAfterMs when longer (a daily free limit). The session
  *   then moves to the first model in PRIORITY that is not cooling down and
  *   whose context limit fits the session, and is sent "continue".
+ * - A rate limit that hits a model again after its cooldown has ended, with no
+ *   successful step on it in between, doubles the cooldown: 10, 20, then 40
+ *   minutes (RATE_LIMIT_MAX_COOLDOWN_MS). A successful step resets it.
  * - When every usable model is cooling down, waits for the earliest cooldown
  *   to end and tries again. Retries forever.
  * - After every step, and before every user prompt, switches back to a
@@ -18,7 +21,17 @@
  *   It only gets the old auto-continue behaviour: "continue" THROTTLE_MS after
  *   a transient error, forever.
  * - Never acts on invalid requests, context overflow (opencode compacts),
- *   content filtering, user interrupts, or child (subagent) sessions.
+ *   content filtering or user interrupts.
+ * - Subagents only run on PRIORITY models: before the subagent tool runs, a
+ *   model argument outside PRIORITY or cooling down (or a missing one) is
+ *   replaced with the parent session's model when that is in PRIORITY and not
+ *   cooling down, otherwise with the best PRIORITY model not cooling down.
+ * - Child (subagent) sessions recover inside opencode's retry (the "retry"
+ *   session hook): on a switchable error the model cools down, the child moves
+ *   to the best PRIORITY model and the retry runs on it at once, so the parent
+ *   never sees the error. A child that still fails only puts its model into a
+ *   cooldown: opencode has already reported the failure to the parent, which
+ *   dispatches the subagent again, so it is not sent "continue".
  *
  * Model limits and variants come from opencode itself (ctx.model.list), so
  * they follow opencode.json.
@@ -44,6 +57,9 @@ const COOLDOWN_MS = 10 * 60_000;
 // A longer retryAfterMs on the error (e.g. a daily free limit) extends the
 // cooldown, up to this cap.
 const MAX_COOLDOWN_MS = 24 * 3600_000;
+// Repeated rate limits double COOLDOWN_MS up to this.
+const RATE_LIMIT_MAX_COOLDOWN_MS = 40 * 60_000;
+const CHILD_RETRY_DELAY_MS = 1_000; // retry delay for a child moved to another model
 const THROTTLE_MS = 60_000; // continue delay for sessions on a model outside PRIORITY
 const MIN_GAP_MS = 5_000; // never send two continues to one session closer than this
 // A model fits a session only if the session's last context size leaves this
@@ -54,6 +70,7 @@ const CATALOG_TTL_MS = 60_000;
 // opencode.json overrides, so nothing read that early is cached.
 const CATALOG_WARMUP_MS = 10_000;
 const CONTINUE_TEXT = "continue";
+const SUBAGENT_TOOL = "subagent"; // opencode's tool that spawns child sessions
 
 // Errors after which the failed model cools down and the session moves on.
 const SWITCH_TYPES = new Set([
@@ -109,12 +126,24 @@ const shared = (globalThis.__opencodePriorityFallback ??= {
   seen: new Map(), // event id -> time, so a location-less event is handled once
   nextInstance: 1,
 });
+// Model key -> rate-limit cooldowns in a row without a successful step. Added
+// separately so an object left by an older version of the plugin gets it too.
+shared.strikes ??= new Map();
 
 const unwrap = (result) => (result && typeof result === "object" && "data" in result ? result.data : result);
 const keyOf = (model) => (model?.providerID && model?.id ? `${model.providerID}/${model.id}` : undefined);
 const refOf = (key) => ({ providerID: key.slice(0, key.indexOf("/")), id: key.slice(key.indexOf("/") + 1) });
 const variantOf = (model) => (model?.variant && model.variant !== "default" ? model.variant : "");
 const label = (model) => (model ? `${keyOf(model)}${variantOf(model) ? `#${variantOf(model)}` : ""}` : "-");
+
+// The subagent tool's model argument: "providerID/modelID" or
+// "providerID/modelID#variant".
+function parseModelArg(value) {
+  if (typeof value !== "string" || !value.includes("/")) return undefined;
+  const hash = value.indexOf("#");
+  const key = hash === -1 ? value : value.slice(0, hash);
+  return { key, variant: hash === -1 ? "" : value.slice(hash + 1) };
+}
 
 function errorText(error) {
   return `${error?.message ?? ""} ${error?.response?.body ?? ""}`;
@@ -132,6 +161,24 @@ function coolingUntil(key, now) {
   const until = shared.cooldowns.get(key) ?? 0;
   if (until && until <= now) shared.cooldowns.delete(key);
   return until > now ? until : 0;
+}
+
+// Put a model into a cooldown after a switchable error. A rate limit that hits
+// the model after its last cooldown has ended counts one more strike; a
+// failure while it is still cooling (another session hit it at the same time)
+// does not.
+function coolDown(key, error, sessionID) {
+  const now = Date.now();
+  let cooldown = COOLDOWN_MS;
+  let strikes = 0;
+  if (error?.type === "provider.rate-limit") {
+    strikes = shared.strikes.get(key) ?? 0;
+    if (!coolingUntil(key, now)) shared.strikes.set(key, ++strikes);
+    cooldown = Math.min(COOLDOWN_MS * 2 ** (Math.max(strikes, 1) - 1), RATE_LIMIT_MAX_COOLDOWN_MS);
+  }
+  cooldown = Math.min(Math.max(cooldown, Number(error?.retryAfterMs) || 0), MAX_COOLDOWN_MS);
+  shared.cooldowns.set(key, Math.max(shared.cooldowns.get(key) ?? 0, now + cooldown));
+  log(`cooldown ${key} for ${cooldown}ms${strikes > 1 ? ` (strike ${strikes})` : ""} after ${summarize(error)} session=${sessionID}`);
 }
 
 function sessionState(sessionID) {
@@ -327,18 +374,22 @@ async function setup(ctx) {
 
   async function onFailed(sessionID, error) {
     const info = await getSession(sessionID);
-    if (!isTopLevel(info)) return;
-    const state = sessionState(sessionID);
+    if (!info || info.time?.archived) return;
     const current = keyOf(info.model);
+    if (info.parentID) {
+      // The parent has already been told; only keep its next dispatch off this model.
+      if (!PRIORITY.includes(current) || !matches(error, SWITCH_TYPES)) return;
+      log(`child failed session=${sessionID} parent=${info.parentID} model=${label(info.model)}`);
+      return coolDown(current, error, sessionID);
+    }
+    const state = sessionState(sessionID);
     const now = Date.now();
     if (!PRIORITY.includes(current)) {
       if (!matches(error, RETRY_TYPES)) return log(`ignore failure session=${sessionID} model=${label(info.model)} ${summarize(error)}`);
       return schedule(sessionID, now + THROTTLE_MS, `model outside priority list, ${summarize(error)}`);
     }
     if (!matches(error, SWITCH_TYPES)) return log(`ignore failure session=${sessionID} model=${label(info.model)} ${summarize(error)}`);
-    const cooldown = Math.min(Math.max(COOLDOWN_MS, Number(error.retryAfterMs) || 0), MAX_COOLDOWN_MS);
-    shared.cooldowns.set(current, now + cooldown);
-    log(`cooldown ${current} for ${cooldown}ms after ${summarize(error)} session=${sessionID}`);
+    coolDown(current, error, sessionID);
     schedule(sessionID, Math.max(now, state.lastContinue + MIN_GAP_MS), "failed");
   }
 
@@ -364,6 +415,62 @@ async function setup(ctx) {
     if (best && PRIORITY.indexOf(best) < rank) {
       await switchTo(sessionID, state, current, best, models, `${why}, tokens=${state.tokens ?? "?"}`);
     }
+  }
+
+  // While opencode retries a child session, move it off a failing model: the
+  // retry then runs on the new model (opencode reloads the session's model for
+  // every attempt), and the subagent job never reports the error to the parent.
+  async function onRetry(event) {
+    if (disposed || !event?.sessionID || !event.decision) return;
+    const info = await getSession(event.sessionID);
+    if (!info?.parentID || info.time?.archived) return; // top-level sessions recover after the final failure
+    const failed = event.model?.providerID ? event.model : info.model;
+    const current = keyOf(failed);
+    if (!PRIORITY.includes(current) || !matches(event.error, SWITCH_TYPES)) return;
+    coolDown(current, event.error, event.sessionID);
+    const state = sessionState(event.sessionID);
+    const models = await catalog();
+    const tokens = await contextTokens(event.sessionID, state);
+    const { best } = pick(tokens, models, Date.now());
+    if (!best) return log(`child retry session=${event.sessionID} attempt=${event.attempt} all models cooling, opencode keeps retrying`);
+    await switchTo(event.sessionID, state, failed, best, models, `child retry attempt=${event.attempt}, tokens=${tokens ?? "?"}`);
+    event.decision = { retry: true, delay: CHILD_RETRY_DELAY_MS };
+  }
+
+  // Before the subagent tool runs, make sure the child session gets a model
+  // from PRIORITY that is not cooling down. The parent's own model is
+  // preferred: the plugin keeps it on a working PRIORITY model.
+  async function enforceSubagentModel(event) {
+    if (disposed || event?.tool !== SUBAGENT_TOOL) return;
+    const input = event.input;
+    if (!input || typeof input !== "object") return;
+    const now = Date.now();
+    const requested = parseModelArg(input.model);
+    if (requested && PRIORITY.includes(requested.key) && !coolingUntil(requested.key, now)) return;
+    if (!requested && input.sessionID) {
+      // Resuming a child without a model keeps the child's model.
+      const child = await getSession(input.sessionID);
+      const childKey = keyOf(child?.model);
+      if (!child || (PRIORITY.includes(childKey) && !coolingUntil(childKey, now))) return;
+    }
+    const parent = await getSession(event.sessionID);
+    let key = keyOf(parent?.model);
+    let variant = variantOf(parent?.model);
+    if (!PRIORITY.includes(key) || coolingUntil(key, now)) {
+      const models = await catalog();
+      const { best, pool } = pick(undefined, models, now);
+      key = best ?? pool[0] ?? PRIORITY[0];
+      const supported = models.get(key)?.variants ?? [];
+      // Like chooseVariant: keep a supported variant, else the strongest one.
+      const wanted = [requested?.variant, variant].filter(Boolean);
+      variant = wanted.find((v) => supported.includes(v)) ?? (wanted.length ? (supported.at(-1) ?? "") : "");
+    }
+    const model = `${key}${variant ? `#${variant}` : ""}`;
+    if (model === input.model) return;
+    event.input = { ...input, model };
+    log(
+      `subagent session=${event.sessionID}${input.sessionID ? ` child=${input.sessionID}` : ""} model ${input.model || "(default)"} -> ${model}`,
+    );
   }
 
   function onEvent(event) {
@@ -395,6 +502,8 @@ async function setup(ctx) {
       case "session.step.ended": {
         const state = sessionState(sessionID);
         state.tokens = stepTokens(data.tokens) ?? state.tokens;
+        const key = keyOf(data.model ?? state.model);
+        if (key && shared.strikes.delete(key)) log(`rate-limit backoff reset for ${key} after a successful step session=${sessionID}`);
         enqueue(sessionID, "switch back", () => switchBack(sessionID, "step ended"));
         return;
       }
@@ -433,6 +542,36 @@ async function setup(ctx) {
     } catch (err) {
       log(`instance=${instance} prompt hook unavailable: ${err?.message ?? err}`);
     }
+    try {
+      registrations.push(
+        await ctx.session.hook("retry", async (event) => {
+          try {
+            await onRetry(event);
+          } catch (err) {
+            log(`child retry handling failed session=${event?.sessionID}: ${err?.message ?? err}`);
+          }
+        }),
+      );
+    } catch (err) {
+      log(`instance=${instance} retry hook unavailable; failing children are not moved: ${err?.message ?? err}`);
+    }
+  }
+  if (typeof ctx.tool?.hook === "function") {
+    try {
+      registrations.push(
+        await ctx.tool.hook("execute.before", async (event) => {
+          try {
+            await enforceSubagentModel(event);
+          } catch (err) {
+            log(`subagent model check failed session=${event?.sessionID}: ${err?.message ?? err}`);
+          }
+        }),
+      );
+    } catch (err) {
+      log(`instance=${instance} tool hook unavailable: ${err?.message ?? err}`);
+    }
+  } else {
+    log(`instance=${instance} tool hook unavailable; subagent models not enforced`);
   }
 
   // Re-arm waits left by a previous instance for this location (config reload).

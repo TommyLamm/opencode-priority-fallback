@@ -78,6 +78,12 @@ function harness(directory = "/home/user") {
       },
     },
     model: { list: async () => ({ data: CATALOG }) },
+    tool: {
+      hook: async (name, fn) => {
+        hooks[name] = fn;
+        return { dispose() {} };
+      },
+    },
   };
   const emit = (type, data, location = { directory }) => {
     queue.push({ id: `evt_${Math.random()}`, type, ...(location ? { location } : {}), data });
@@ -99,6 +105,16 @@ const fail = (id, type, message = "boom") => h.emit("session.execution.failed", 
 const stepEnd = (id, tokens = 1000, finish = "tool-calls") =>
   h.emit("session.step.ended", { sessionID: id, assistantMessageID: "msg", finish, tokens: { input: tokens, output: 0, reasoning: 0, cache: { read: 0, write: 0 } } });
 const stepStart = (id, key, variant) => h.emit("session.step.started", { sessionID: id, assistantMessageID: "msg", agent: "build", model: ref(key, variant) });
+const cooldownMinutes = (key) => Math.round(((globalThis.__opencodePriorityFallback.cooldowns.get(key) ?? 0) - Date.now()) / MIN);
+const coolFor = (key, ms) => globalThis.__opencodePriorityFallback.cooldowns.set(key, Date.now() + ms);
+const RATE_LIMIT = { type: "provider.rate-limit", message: "Provider request failed with HTTP 429", status: 429 };
+const retryEvent = (id, key, variant, error = RATE_LIMIT) => ({
+  sessionID: id,
+  model: ref(key, variant),
+  error,
+  attempt: 1,
+  decision: { retry: true, delay: 8_000 },
+});
 
 beforeEach(() => {
   mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: 1_800_000_000_000 });
@@ -107,6 +123,7 @@ beforeEach(() => {
     shared.cooldowns.clear();
     shared.sessions.clear();
     shared.seen.clear();
+    shared.strikes.clear();
   }
 });
 afterEach(async () => {
@@ -201,14 +218,113 @@ test("non-switchable errors and interrupts are ignored", async () => {
   assert.deepEqual(h.calls, []);
 });
 
-test("child sessions are never touched", async () => {
+test("a child's final failure only cools its model: no switch, no continue", async () => {
   await start();
   h.addSession("c1", M1, undefined, { parentID: "s1" });
   fail("c1", "provider.rate-limit");
   stepStart("c1", M2);
   stepEnd("c1");
   await flush();
+  assert.equal(cooldownMinutes(M1), 10);
+  mock.timers.tick(30 * MIN);
+  await flush();
   assert.deepEqual(h.calls, []);
+});
+
+test("a child retry moves the child to the best model and retries at once", async () => {
+  await start();
+  coolFor(M1, 60 * MIN);
+  coolFor(M2, 60 * MIN);
+  h.addSession("s1", M3, "max");
+  h.addSession("c1", M3, "max", { parentID: "s1" });
+  const event = retryEvent("c1", M3, "max");
+  await h.hooks.retry(event);
+  assert.deepEqual(h.calls, [`switch c1 ${M4}#thinking`]);
+  assert.deepEqual(event.decision, { retry: true, delay: 1_000 });
+  assert.equal(cooldownMinutes(M3), 10);
+});
+
+test("a child retry that opencode would give up on is retried on the next model", async () => {
+  await start();
+  h.addSession("c1", M1, undefined, { parentID: "s1" });
+  const event = { ...retryEvent("c1", M1, undefined, { type: "provider.free-limit", message: "Free usage limit reached." }), decision: { retry: false } };
+  await h.hooks.retry(event);
+  assert.deepEqual(h.calls, [`switch c1 ${M2}`]);
+  assert.deepEqual(event.decision, { retry: true, delay: 1_000 });
+});
+
+test("retries of top-level sessions, ignored errors and models outside the list are left to opencode", async () => {
+  await start();
+  h.addSession("s1", M1);
+  h.addSession("c1", M1, undefined, { parentID: "s1" });
+  h.addSession("c2", OUTSIDE, undefined, { parentID: "s1" });
+  const events = [
+    retryEvent("s1", M1),
+    retryEvent("c1", M1, undefined, { type: "provider.rate-limit", message: "maximum context length exceeded" }),
+    retryEvent("c2", OUTSIDE),
+  ];
+  for (const event of events) await h.hooks.retry(event);
+  assert.deepEqual(h.calls, []);
+  for (const event of events) assert.deepEqual(event.decision, { retry: true, delay: 8_000 });
+  assert.equal(globalThis.__opencodePriorityFallback.cooldowns.size, 0);
+});
+
+test("repeated rate limits back off 10, 20, then 40 minutes; a successful step resets it", async () => {
+  await start();
+  for (const [i, expected] of [10, 20, 40, 40].entries()) {
+    h.addSession(`s${i}`, M1);
+    fail(`s${i}`, "provider.rate-limit");
+    await flush();
+    assert.equal(cooldownMinutes(M1), expected, `failure ${i + 1}`);
+    mock.timers.tick(expected * MIN + 1);
+    await flush();
+  }
+  h.addSession("ok", M1);
+  stepStart("ok", M1);
+  stepEnd("ok");
+  await flush();
+  h.addSession("again", M1);
+  fail("again", "provider.rate-limit");
+  await flush();
+  assert.equal(cooldownMinutes(M1), 10, "reset after the successful step");
+});
+
+test("a rate limit while the model is still cooling does not add a strike", async () => {
+  await start();
+  h.addSession("s1", M1);
+  h.addSession("c1", M1, undefined, { parentID: "s1" });
+  fail("s1", "provider.rate-limit");
+  fail("c1", "provider.rate-limit");
+  await flush();
+  assert.equal(cooldownMinutes(M1), 10);
+  assert.equal(globalThis.__opencodePriorityFallback.strikes.get(M1), 1);
+});
+
+test("a subagent model outside the list is replaced with the parent's model", async () => {
+  await start();
+  h.addSession("s1", M1, "max");
+  const outside = { tool: "subagent", sessionID: "s1", input: { agent: "general", model: `${OUTSIDE}#max` } };
+  const omitted = { tool: "subagent", sessionID: "s1", input: { agent: "general" } };
+  const listed = { tool: "subagent", sessionID: "s1", input: { agent: "general", model: `${M4}#thinking` } };
+  const other = { tool: "shell", sessionID: "s1", input: { model: OUTSIDE } };
+  for (const event of [outside, omitted, listed, other]) await h.hooks["execute.before"](event);
+  assert.equal(outside.input.model, `${M1}#max`);
+  assert.equal(omitted.input.model, `${M1}#max`);
+  assert.equal(listed.input.model, `${M4}#thinking`);
+  assert.equal(other.input.model, OUTSIDE);
+});
+
+test("a subagent is not started on a cooling model", async () => {
+  await start();
+  coolFor(M1, 60 * MIN);
+  coolFor(M2, 60 * MIN);
+  coolFor(M3, 10 * MIN);
+  h.addSession("s1", M3, "max");
+  const fromParent = { tool: "subagent", sessionID: "s1", input: { agent: "general" } };
+  const explicit = { tool: "subagent", sessionID: "s1", input: { agent: "general", model: `${M3}#max` } };
+  for (const event of [fromParent, explicit]) await h.hooks["execute.before"](event);
+  assert.equal(fromParent.input.model, `${M4}#thinking`, "max is not a minimax variant: its strongest is used");
+  assert.equal(explicit.input.model, `${M4}#thinking`);
 });
 
 test("a model outside the list is continued after 60s on the same model, quota is ignored", async () => {

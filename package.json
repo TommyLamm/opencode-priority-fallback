@@ -1,6 +1,6 @@
 {
   "name": "opencode-priority-fallback",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "opencode 2.x plugin: keep sessions on the highest-priority available model, fall back only after native retries are exhausted, switch back after a cooldown",
   "type": "module",
   "main": "priority-fallback.js",

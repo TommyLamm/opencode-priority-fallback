@@ -2,11 +2,13 @@
 
 [opencode](https://opencode.ai) 2.x 的插件：讓每個會話盡量使用優先序最高、目前可用的模型。
 
-- **不干預 opencode 自己的重試。** 目前的模型重試全部失敗、執行真的停下後，才切到下一個模型，並自動送出 `continue`。
+- **不干預主會話的原生重試。** 目前的模型重試全部失敗、執行真的停下後，才切到下一個模型，並自動送出 `continue`。
 - **失敗的模型冷卻 10 分鐘。** 錯誤有指定更長的等待時間（`retryAfterMs`，例如每日免費額度要等到隔天重置）時，就冷卻到那個時間，最多 24 小時。冷卻結束後，在下一步結束時或你發新訊息時切回去。
+- **同一個模型一再被限流，冷卻時間加倍。** 10、20、40 分鐘，之後維持 40 分鐘；那個模型成功跑完一步就重設回 10 分鐘。
 - **全部模型都在冷卻時，等最早結束冷卻的那個再試。** 無限次重試，不需要人工介入。
+- **子代理也只用清單內的模型。** 派出子代理時，清單外或正在冷卻的模型會被換掉；子代理在重試中出錯時，直接換到下一個模型重試，主會話不會收到錯誤。
 
-和 [opencode-runtime-fallback](https://www.npmjs.com/package/opencode-runtime-fallback) 的差別：runtime-fallback 在第一次出錯時就攔下原生重試並換模型；這個插件則讓原生重試先跑完。
+和 [opencode-runtime-fallback](https://www.npmjs.com/package/opencode-runtime-fallback) 的差別：runtime-fallback 在第一次出錯時就攔下原生重試並換模型；這個插件則讓主會話的原生重試先跑完。
 
 ## 需求
 
@@ -50,11 +52,34 @@
 
 如果所有能用的模型都在冷卻，就等最早結束冷卻的那個，到時候再重複上面的步驟。
 
+### 重複限流時延長冷卻
+
+`rate-limit` 錯誤會記一次「失敗」。模型冷卻結束後又被限流，而且這段期間沒有在它上面成功跑完任何一步，冷卻時間就加倍：第一次 10 分鐘、第二次 20 分鐘、之後都是 40 分鐘（`RATE_LIMIT_MAX_COOLDOWN_MS`）。這樣就不會每 10 分鐘切回一個還在限流的模型、馬上又失敗。
+
+- 在那個模型上成功跑完一步（`session.step.ended`），就重設回 10 分鐘。
+- 模型還在冷卻時，其他會話剛好也在它上面失敗（例如主會話和子代理同時被限流），不會多算一次。
+- 其他錯誤類型不加倍，維持 `COOLDOWN_MS`；錯誤的 `retryAfterMs` 比較長時照樣以它為準。
+
 等待期間，只有在新的 execution 真的開始跑步驟（`session.step.started`）時才會取消等待，例如你自己發了新訊息。opencode 在失敗後有時會立刻開一個不跑任何步驟、馬上就成功結束的空 execution，這種不會取消等待。
 
 ### 切回優先序更高的模型
 
 在每一步結束時（`session.step.ended`），以及你送出新訊息、訊息開始執行之前（`prompt` hook），只要有優先序更高的模型已經結束冷卻、而且 context 裝得下，就切回去。`switchModel` 從下一次請求開始生效，所以長時間自動執行的任務中途也會切回。
+
+### 子代理（subagent）
+
+**派出時（`tool` 的 `execute.before` hook）**：`subagent` 工具執行前檢查它的 `model` 參數。參數是清單外的模型、正在冷卻的模型，或沒有指定時，就換成：
+
+1. 主會話目前的模型，前提是它在清單內而且沒在冷卻
+2. 否則用清單裡第一個沒在冷卻的模型
+
+variant 沿用指定的或主會話的；目標模型沒有同名的 variant，就用最強的那個。指定的模型在清單內、也沒在冷卻，就照原樣保留。
+
+**重試時（`session` 的 `retry` hook）**：子會話的請求出錯、opencode 準備重試時，如果錯誤屬於「會切換」的那一類，就讓目前的模型進入冷卻，把子會話切到最好的可用模型，並讓 opencode 在 1 秒後（`CHILD_RETRY_DELAY_MS`）用新模型重試。opencode 每次重試都會重新讀取會話的模型，所以重試直接跑在新模型上；opencode 原本不打算重試的錯誤（例如免費額度用完）也會改成重試。整個過程子代理沒有失敗，主會話只會收到成功的結果。
+
+**重試後仍然失敗**（例如所有模型都在冷卻）：只讓那個模型進入冷卻，不會送 `continue`。這時 opencode 已經把失敗回報給主會話，主會話通常會重新派一次子代理；如果再對子會話送 `continue`，同一份工作就會做兩次。重新派出的子代理會因為冷卻而用到別的模型。
+
+主會話的 `retry` 不受影響，仍然等原生重試跑完。
 
 ### context 容量
 
@@ -78,7 +103,7 @@
 | `invalid-request`、`content-filter`、`unsupported-operation` | 不處理 | 不處理 |
 | 錯誤訊息看起來是 context 超限、無效請求或取消 | 不處理 | 不處理 |
 
-另外也不會處理這些情況：你手動中止、子代理（subagent）的子會話、已封存的會話。
+另外也不會處理這些情況：你手動中止、已封存的會話。子代理的子會話不會切回優先序更高的模型，也不會被送 `continue`（見上方「子代理」）。
 
 ### 手動選擇模型
 
@@ -92,6 +117,8 @@
 | `PRIORITY` | 見上方 | 模型優先序 |
 | `COOLDOWN_MS` | 10 分鐘 | 失敗模型的冷卻時間 |
 | `MAX_COOLDOWN_MS` | 24 小時 | 錯誤的 `retryAfterMs` 比 `COOLDOWN_MS` 長時，冷卻時間的上限 |
+| `RATE_LIMIT_MAX_COOLDOWN_MS` | 40 分鐘 | 重複限流時，加倍後的冷卻時間上限 |
+| `CHILD_RETRY_DELAY_MS` | 1 秒 | 子會話換模型後，等多久重試 |
 | `THROTTLE_MS` | 60 秒 | 清單外模型失敗後，等多久才送 `continue` |
 | `MIN_GAP_MS` | 5 秒 | 同一個會話兩次 `continue` 之間的最短間隔 |
 | `CONTEXT_HEADROOM` | 32,000 | 判斷 context 裝不裝得下時預留的空間 |
@@ -99,7 +126,7 @@
 
 ## Log
 
-每次冷卻、切換、送出 `continue` 都會記錄在：
+每次冷卻、切換、送出 `continue`、改寫子代理的模型都會記錄在：
 
 ```
 ~/.local/share/opencode/log/priority-fallback.log
@@ -113,6 +140,9 @@
 cooldown opencode/claude-sonnet-5-5 for 600000ms after type=provider.quota status=402 message="Upstream request failed: Insufficient account funds"
 switch session=ses_... opencode/claude-sonnet-5-5 -> opencode/deepseek-v4.1-flash-free (recover, tokens=?)
 sent continue session=ses_... attempt=1 model=opencode/deepseek-v4.1-flash-free
+subagent session=ses_... model nvidia/z-ai/glm-5.3 -> opencode/deepseek-v4.1-flash-free#max
+cooldown nvidia/deepseek-ai/deepseek-v4.1-flash for 1200000ms (strike 2) after type=provider.rate-limit status=429 message="Provider request failed with HTTP 429: ..." session=ses_...
+switch session=ses_... nvidia/deepseek-ai/deepseek-v4.1-flash#max -> nvidia/minimaxai/minimax-m3.1-flash#thinking (child retry attempt=2, tokens=?)
 ```
 
 ## 安全性
@@ -122,7 +152,8 @@ sent continue session=ses_... attempt=1 model=opencode/deepseek-v4.1-flash-free
 
 ## 限制
 
-- **冷卻狀態只存在記憶體裡**，opencode 重啟後就清空。
+- **冷卻狀態和限流次數只存在記憶體裡**，opencode 重啟後就清空。
+- **子代理重試後仍然失敗時不會自動接續**，要靠主會話重新派出（原因見上方「子代理」）。
 - **opencode 剛啟動的前 10 秒**，`ctx.model.list()` 回傳的是 models.dev 的原始上限，還沒套用 `opencode.json` 的覆寫值。這段期間讀到的值不會快取，但如果剛好在這幾秒內發生失敗，判斷 context 是否裝得下時用的會是原始值。
 - **每次切換都會在對話紀錄裡留下一筆「model switched」**。
 
