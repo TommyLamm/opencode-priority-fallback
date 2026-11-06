@@ -45,6 +45,7 @@ const flush = async (n = 20) => {
 
 function harness(directory = "/home/user") {
   const queue = [];
+  const subscribed = [];
   let wake;
   const calls = [];
   const sessions = new Map();
@@ -52,14 +53,21 @@ function harness(directory = "/home/user") {
   const ctx = {
     location: { directory },
     event: {
-      subscribe: ({ signal }) => ({
-        async *[Symbol.asyncIterator]() {
-          while (!signal.aborted) {
-            if (queue.length) yield queue.shift();
-            else await new Promise((r) => (wake = r));
-          }
-        },
-      }),
+      // Applies the types filter the way opencode 2.2 does, so a handled event
+      // missing from the plugin's filter fails its test.
+      subscribe: ({ signal, types }) => {
+        subscribed.push(types);
+        return {
+          async *[Symbol.asyncIterator]() {
+            while (!signal.aborted) {
+              if (queue.length) {
+                const event = queue.shift();
+                if (!types || types.includes(event.type)) yield event;
+              } else await new Promise((r) => (wake = r));
+            }
+          },
+        };
+      },
     },
     session: {
       get: async ({ sessionID }) => ({ data: structuredClone(sessions.get(sessionID)) }),
@@ -90,7 +98,7 @@ function harness(directory = "/home/user") {
     wake?.();
   };
   const addSession = (id, key, variant, extra = {}) => sessions.set(id, { id, model: ref(key, variant), time: {}, ...extra });
-  return { ctx, calls, sessions, hooks, emit, addSession, stop: () => wake?.() };
+  return { ctx, calls, sessions, hooks, emit, addSession, subscribed, stop: () => wake?.() };
 }
 
 let h;
@@ -453,4 +461,115 @@ test("limits read during warm-up are not cached", async () => {
   fail("s1", "provider.rate-limit");
   await flush();
   assert.deepEqual(h.calls, [`switch s1 ${M2}`, "prompt s1 continue"], "glm-free override (300K) holds 250K");
+});
+
+for (const type of ["provider.go-limit", "provider.budget-limit", "provider.model-budget-limit", "provider.chatgpt-limit"]) {
+  test(`${type} cools the model down and switches`, async () => {
+    await start();
+    h.addSession("s1", M1, "max");
+    stepStart("s1", M1, "max");
+    fail("s1", type, "Usage limit reached. Switch models to keep going.");
+    await flush();
+    assert.deepEqual(h.calls, [`switch s1 ${M2}#max`, "prompt s1 continue"]);
+    assert.equal(cooldownMinutes(M1), 10);
+  });
+
+  test(`${type} on a model outside the list is left alone`, async () => {
+    await start();
+    h.addSession("s1", OUTSIDE, "max");
+    fail("s1", type, "Usage limit reached. Switch models to keep going.");
+    await flush();
+    mock.timers.tick(5 * MIN);
+    await flush();
+    assert.deepEqual(h.calls, []);
+  });
+}
+
+test("throttling that reads like overflow switches; real overflow is still left alone", async () => {
+  await start();
+  for (const [i, message] of [
+    "Too many tokens, please wait before trying again.",
+    "Too many tokens per day, please wait until tomorrow",
+    "Rate limit reached: too many tokens per minute",
+    "Too many requests: context size limit for this tier",
+  ].entries()) {
+    const id = `throttled${i}`;
+    h.addSession(id, M3);
+    fail(id, "provider.rate-limit", message);
+    await flush();
+    assert.ok(h.calls.includes(`prompt ${id} continue`), message);
+    globalThis.__opencodePriorityFallback.cooldowns.clear();
+  }
+  h.calls.length = 0;
+  for (const [i, message] of ["too many tokens", "maximum context length exceeded", "prompt is too long"].entries()) {
+    const id = `overflow${i}`;
+    h.addSession(id, M3);
+    fail(id, "provider.rate-limit", message);
+  }
+  await flush();
+  assert.deepEqual(h.calls, []);
+});
+
+test("a throttled child moves to the next model during its retry", async () => {
+  await start();
+  h.addSession("c1", M1, undefined, { parentID: "p1" });
+  const event = retryEvent("c1", M1, undefined, { type: "provider.rate-limit", message: "Too many tokens, please wait", status: 429 });
+  await h.hooks.retry(event);
+  assert.deepEqual(h.calls, [`switch c1 ${M2}`]);
+  assert.deepEqual(event.decision, { retry: true, delay: 1_000 });
+});
+
+test("resetsAt in the response body keeps the model cooling until then, up to 24 hours", async () => {
+  await start();
+  const limit = (hours) => ({
+    type: "provider.go-limit",
+    message: "OpenCode Go usage limit reached.",
+    status: 429,
+    response: { body: JSON.stringify({ error: "GoUsageLimitError", resetsAt: new Date(Date.now() + hours * 60 * MIN).toISOString() }) },
+  });
+  h.addSession("s1", M1);
+  h.emit("session.execution.failed", { sessionID: "s1", error: limit(3) });
+  await flush();
+  assert.equal(cooldownMinutes(M1), 180);
+  h.addSession("s2", M2);
+  h.emit("session.execution.failed", { sessionID: "s2", error: limit(72) });
+  await flush();
+  assert.equal(cooldownMinutes(M2), 24 * 60);
+});
+
+test("an unreadable resetsAt falls back to the normal cooldown", async () => {
+  await start();
+  h.addSession("s1", M1);
+  h.emit("session.execution.failed", {
+    sessionID: "s1",
+    error: { type: "provider.go-limit", message: "limit", response: { body: '{"resetsAt":"soon"}' } },
+  });
+  await flush();
+  assert.equal(cooldownMinutes(M1), 10);
+});
+
+test("subscribes only to the events it handles", async () => {
+  await start();
+  assert.deepEqual([...h.subscribed[0]].sort(), [
+    "session.deleted",
+    "session.execution.failed",
+    "session.execution.interrupted",
+    "session.execution.started",
+    "session.execution.succeeded",
+    "session.model.selected",
+    "session.step.ended",
+    "session.step.started",
+  ]);
+});
+
+test("models that are not chat models are never picked", async () => {
+  await start();
+  h.ctx.model.list = async () => ({
+    data: CATALOG.map((m) => (m.id === "glm-5.3-flash-free" ? { ...m, type: "image" } : m.id === "deepseek-ai/deepseek-v4.1-flash" ? { ...m, type: "chat" } : m)),
+  });
+  mock.timers.tick(11_000);
+  h.addSession("s1", M1);
+  fail("s1", "provider.rate-limit");
+  await flush();
+  assert.deepEqual(h.calls, [`switch s1 ${M3}`, "prompt s1 continue"]);
 });

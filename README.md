@@ -3,7 +3,7 @@
 [opencode](https://opencode.ai) 2.x 的插件：讓每個會話盡量使用優先序最高、目前可用的模型。
 
 - **不干預主會話的原生重試。** 目前的模型重試全部失敗、執行真的停下後，才切到下一個模型，並自動送出 `continue`。
-- **失敗的模型冷卻 10 分鐘。** 錯誤有指定更長的等待時間（`retryAfterMs`，例如每日免費額度要等到隔天重置）時，就冷卻到那個時間，最多 24 小時。冷卻結束後，在下一步結束時或你發新訊息時切回去。
+- **失敗的模型冷卻 10 分鐘。** 錯誤有指定更長的等待時間（`retryAfterMs`，或回應內容裡的 `resetsAt`，例如每日免費額度要等到隔天重置）時，就冷卻到那個時間，最多 24 小時。冷卻結束後，在下一步結束時或你發新訊息時切回去。
 - **同一個模型一再被限流，冷卻時間加倍。** 10、20、40 分鐘，之後維持 40 分鐘；那個模型成功跑完一步就重設回 10 分鐘。
 - **全部模型都在冷卻時，等最早結束冷卻的那個再試。** 無限次重試，不需要人工介入。
 - **子代理也只用清單內的模型。** 派出子代理時，清單外或正在冷卻的模型會被換掉；子代理在重試中出錯時，直接換到下一個模型重試，主會話不會收到錯誤。
@@ -12,7 +12,7 @@
 
 ## 需求
 
-- opencode 2.x，使用 V2 插件 API（`export default { id, setup }`）。在 **opencode 2.1.4** 上驗證過。
+- opencode 2.x，使用 V2 插件 API（`export default { id, setup }`）。在 **opencode 2.2.5** 上驗證過，2.1.4 仍可使用（2.2 才有的事件過濾會被舊版忽略）。
 - 不需要任何相依套件，只用 Node 內建模組。
 
 ## 安裝
@@ -46,7 +46,7 @@
 
 收到 `session.execution.failed`，代表 opencode 的原生重試已經用完，或錯誤本來就不會重試。這時：
 
-1. 錯誤類型屬於「會切換」的那一類，就讓目前的模型進入冷卻。冷卻時間是 `COOLDOWN_MS` 和錯誤的 `retryAfterMs` 中較長的那個，上限 `MAX_COOLDOWN_MS`。冷卻是全域的，所有會話共用。
+1. 錯誤類型屬於「會切換」的那一類，就讓目前的模型進入冷卻。冷卻時間是 `COOLDOWN_MS` 和距離限額重置的時間（錯誤的 `retryAfterMs`，或回應內容裡的 `resetsAt`）中較長的那個，上限 `MAX_COOLDOWN_MS`。冷卻是全域的，所有會話共用。
 2. 從 `PRIORITY` 裡挑第一個「沒在冷卻、而且 context 裝得下」的模型，切過去（`session.switchModel`）。
 3. 送出 `continue`，讓會話繼續工作。
 
@@ -99,9 +99,11 @@ variant 沿用指定的或主會話的；目標模型沒有同名的 variant，�
 | 錯誤類型 | 清單內的模型 | 清單外的模型（手動選的） |
 |---|---|---|
 | `rate-limit`、`internal`、`transport`、`timeout`、`connect`、`unknown`、`invalid-output` | 冷卻並切換 | 60 秒後送 `continue`，留在同一個模型 |
-| `error`、`quota`、`free-limit`、`auth`、`no-route` | 冷卻並切換 | 不處理 |
+| `error`、`quota`、`free-limit`、`go-limit`、`budget-limit`、`model-budget-limit`、`chatgpt-limit`、`auth`、`no-route` | 冷卻並切換 | 不處理 |
 | `invalid-request`、`content-filter`、`unsupported-operation` | 不處理 | 不處理 |
 | 錯誤訊息看起來是 context 超限、無效請求或取消 | 不處理 | 不處理 |
+
+訊息同時符合 opencode 的限流判斷時（`rate limit`、`too many requests`、`too many tokens, please wait` 等），不算 context 超限，照錯誤類型處理。
 
 另外也不會處理這些情況：你手動中止、已封存的會話。子代理的子會話不會切回優先序更高的模型，也不會被送 `continue`（見上方「子代理」）。
 

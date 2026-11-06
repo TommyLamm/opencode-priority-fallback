@@ -7,7 +7,8 @@
  * - Never touches a top-level session's own retries. Only after its execution
  *   has finally failed (session.execution.failed) with a switchable error does
  *   the failed model go into a cooldown (shared by all sessions): COOLDOWN_MS,
- *   or the error's retryAfterMs when longer (a daily free limit). The session
+ *   or the time until the limit resets when longer (the error's retryAfterMs,
+ *   or resetsAt in its response body). The session
  *   then moves to the first model in PRIORITY that is not cooling down and
  *   whose context limit fits the session, and is sent "continue".
  * - A rate limit that hits a model again after its cooldown has ended, with no
@@ -54,7 +55,7 @@ const PRIORITY = [
   "nvidia/z-ai/glm-5.3-flash",
 ];
 const COOLDOWN_MS = 10 * 60_000;
-// A longer retryAfterMs on the error (e.g. a daily free limit) extends the
+// A longer time until the limit resets (e.g. a daily free limit) extends the
 // cooldown, up to this cap.
 const MAX_COOLDOWN_MS = 24 * 3600_000;
 // Repeated rate limits double COOLDOWN_MS up to this.
@@ -72,6 +73,19 @@ const CATALOG_WARMUP_MS = 10_000;
 const CONTINUE_TEXT = "continue";
 const SUBAGENT_TOOL = "subagent"; // opencode's tool that spawns child sessions
 
+// The events onEvent handles. opencode 2.2 only sends these to the plugin; older
+// versions ignore the filter and send everything, which onEvent skips anyway.
+const EVENT_TYPES = [
+  "session.step.started",
+  "session.step.ended",
+  "session.model.selected",
+  "session.execution.started",
+  "session.execution.succeeded",
+  "session.execution.failed",
+  "session.execution.interrupted",
+  "session.deleted",
+];
+
 // Errors after which the failed model cools down and the session moves on.
 const SWITCH_TYPES = new Set([
   "provider.rate-limit",
@@ -84,6 +98,10 @@ const SWITCH_TYPES = new Set([
   "provider.error",
   "provider.quota",
   "provider.free-limit",
+  "provider.go-limit",
+  "provider.budget-limit",
+  "provider.model-budget-limit",
+  "provider.chatgpt-limit",
   "provider.auth",
   "provider.no-route",
 ]);
@@ -100,10 +118,14 @@ const RETRY_TYPES = new Set([
   "provider.invalid-output",
 ]);
 
-// Safety net: never act when the message looks like context overflow, an
-// invalid request or a cancellation, whatever the error type says.
-const NEVER_PATTERN =
-  /context.{0,30}(length|window|limit|size)|prompt is too long|too many tokens|maximum.{0,20}length|reduce the length|invalid request|aborted|cancell?ed|interrupted/i;
+// Safety net: never act when the message looks like an invalid request, a
+// cancellation or context overflow, whatever the error type says.
+const NEVER_PATTERN = /invalid request|aborted|cancell?ed|interrupted/i;
+const OVERFLOW_PATTERN =
+  /context.{0,30}(length|window|limit|size)|prompt is too long|too many tokens|maximum.{0,20}length|reduce the length/i;
+// Throttling that can read like overflow, as opencode 2.2 classifies it: opencode
+// retries these instead of compacting, so they are not left alone as overflow.
+const THROTTLE_PATTERN = /^(throttling error|service unavailable):|rate limit|too many requests|too many tokens(?: per day)?, please wait/i;
 
 const LOG_FILE = join(
   process.env.XDG_DATA_HOME || join(homedir(), ".local", "share"),
@@ -154,7 +176,18 @@ function summarize(error) {
 }
 
 function matches(error, types) {
-  return !!error && types.has(error.type) && !NEVER_PATTERN.test(errorText(error));
+  if (!error || !types.has(error.type)) return false;
+  const text = errorText(error);
+  if (NEVER_PATTERN.test(text)) return false;
+  return THROTTLE_PATTERN.test(text) || !OVERFLOW_PATTERN.test(text);
+}
+
+// How long until the limit behind this error resets, if it says. Usage limits
+// may only carry the time in their response body, e.g. "resetsAt":"2026-11-07T00:00:00Z".
+function resetDelayMs(error, now) {
+  const retryAfter = Number(error?.retryAfterMs) || 0;
+  const resetsAt = Date.parse(/"resetsAt"\s*:\s*"([^"]+)"/.exec(error?.response?.body ?? "")?.[1] ?? "");
+  return Math.max(retryAfter, Number.isNaN(resetsAt) ? 0 : resetsAt - now);
 }
 
 function coolingUntil(key, now) {
@@ -176,7 +209,7 @@ function coolDown(key, error, sessionID) {
     if (!coolingUntil(key, now)) shared.strikes.set(key, ++strikes);
     cooldown = Math.min(COOLDOWN_MS * 2 ** (Math.max(strikes, 1) - 1), RATE_LIMIT_MAX_COOLDOWN_MS);
   }
-  cooldown = Math.min(Math.max(cooldown, Number(error?.retryAfterMs) || 0), MAX_COOLDOWN_MS);
+  cooldown = Math.min(Math.max(cooldown, resetDelayMs(error, now)), MAX_COOLDOWN_MS);
   shared.cooldowns.set(key, Math.max(shared.cooldowns.get(key) ?? 0, now + cooldown));
   log(`cooldown ${key} for ${cooldown}ms${strikes > 1 ? ` (strike ${strikes})` : ""} after ${summarize(error)} session=${sessionID}`);
 }
@@ -243,7 +276,8 @@ async function setup(ctx) {
         models.set(`${model.providerID}/${model.id}`, {
           context: model.limit?.context,
           variants: (model.variants ?? []).map((variant) => variant.id),
-          enabled: model.enabled !== false,
+          // opencode 2.2 lists image and decision models too; sessions only run on chat models.
+          enabled: model.enabled !== false && (model.type === undefined || model.type === "chat"),
         });
       }
     } catch (err) {
@@ -590,7 +624,7 @@ async function setup(ctx) {
 
   // ctx.event.subscribe({ signal }) returns an async iterable of events.
   const controller = new AbortController();
-  const stream = ctx.event.subscribe({ signal: controller.signal });
+  const stream = ctx.event.subscribe({ signal: controller.signal, types: EVENT_TYPES });
   if (!stream || typeof stream[Symbol.asyncIterator] !== "function") {
     log(`instance=${instance} event.subscribe did not return an async iterable; plugin inactive`);
     return;
